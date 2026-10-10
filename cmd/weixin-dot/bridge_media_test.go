@@ -101,17 +101,18 @@ func (f *bridgeMediaNativeFake) Send(_ context.Context, _, text, request string,
 
 type bridgeMediaWeixinFake struct {
 	bridgeWeixinFake
-	downloading  chan struct{}
-	release      chan struct{}
-	downloadSize int64
-	slots        int
-	uploads      int
-	mediaSends   []weixin.SendMediaRequest
-	slotErr      error
-	uploadErr    error
-	mediaSendErr error
-	beforeSlot   func(*weixin.MediaUploadPlan) error
-	beforeUpload func(*weixin.MediaUploadPlan) error
+	downloading     chan struct{}
+	release         chan struct{}
+	downloadSize    int64
+	slots           int
+	uploads         int
+	mediaSends      []weixin.SendMediaRequest
+	slotErr         error
+	uploadErr       error
+	mediaSendErr    error
+	beforeSlot      func(*weixin.MediaUploadPlan) error
+	beforeUpload    func(*weixin.MediaUploadPlan) error
+	beforeMediaSend func(weixin.SendMediaRequest)
 }
 
 func (f *bridgeMediaWeixinFake) DownloadMedia(ctx context.Context, item weixin.MessageItem, opts weixin.MediaOptions) (*weixin.MediaFile, error) {
@@ -159,6 +160,9 @@ func (f *bridgeMediaWeixinFake) UploadPreparedMedia(_ context.Context, plan *wei
 	return &weixin.UploadedMedia{FileKey: plan.FileKey, AESKeyHex: plan.AESKeyHex, MD5: plan.MD5, SHA256: plan.SHA256, Name: plan.Name, MIME: plan.MIME, ToUserID: plan.ToUserID, RawSize: plan.RawSize, CipherSize: plan.CipherSize, Type: plan.Type, DownloadParam: "private-download-param"}, nil
 }
 func (f *bridgeMediaWeixinFake) SendMedia(_ context.Context, in weixin.SendMediaRequest) (*weixin.SendResult, error) {
+	if f.beforeMediaSend != nil {
+		f.beforeMediaSend(in)
+	}
 	f.mediaSends = append(f.mediaSends, in)
 	if f.mediaSendErr != nil {
 		return nil, f.mediaSendErr
@@ -502,6 +506,178 @@ func TestBridgeUnknownMediaMessageAllowsLaterTextAndKeepsFiles(t *testing.T) {
 	}
 }
 
+func TestBridgeUploadedMediaKnownRejectionResumesSamePayloadAfterRestart(t *testing.T) {
+	e, n, w := bridgeTestMediaEngine(t)
+	n.downloadSize, n.downloadMIME = 32, "image/png"
+	m := bridgeNativeWithFile("image-first", "")
+	m.Content.Text = ""
+	for _, fileID := range []string{"image-second", "image-third"} {
+		raw, _ := json.Marshal(chatgpt.FileReference{Type: "file", FileID: fileID})
+		m.Content.Attachments = append(m.Content.Attachments, raw)
+	}
+	if err := e.queueNative(m, false, bridgeNativeFingerprint(m)); err != nil {
+		t.Fatal(err)
+	}
+	for phase := 0; phase < 4; phase++ {
+		if err := e.deliverWeixin(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		bridgeFinishMedia(t, e)
+	}
+	w.mediaSendErr = &weixin.APIError{Op: "sendmessage", Kind: weixin.ErrAPI, Ret: -2}
+	if err := e.deliverWeixin(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	first := e.state.Outbound[0]
+	key, clientID, text, mediaHash := first.Key, first.ClientID, first.Text, bridgeHash(first.Media)
+	failure := *first.LastFailure
+	for pass := 0; pass < 2; pass++ {
+		if err := e.deliverWeixin(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(w.mediaSends) != 1 || len(n.downloads) != 1 || w.slots != 1 || w.uploads != 1 ||
+		first.Status != "rejected" || first.Attempts != 1 || e.state.Outbound[1].Media.Stage != "received" || e.state.Outbound[2].Media.Stage != "received" {
+		t.Fatal("same-context rejection replayed a mutation or later images overtook the blocked original")
+	}
+	e.state = bridgeClone(t, e.state) // Resume with exactly the same journal identities.
+	e.state.ContextToken = "renewed-context"
+	var durable *bridgeState
+	e.persist = func(s *bridgeState) error { durable = bridgeClone(t, s); return nil }
+	w.beforeMediaSend = func(input weixin.SendMediaRequest) {
+		if durable == nil {
+			t.Fatal("media POST lacked a durable journal")
+		}
+		for _, saved := range durable.Outbound {
+			if saved.ClientID != input.ClientID {
+				continue
+			}
+			if saved.Status != "attempting" || saved.ContextToken != input.ContextToken ||
+				bridgeHash(saved.Media.Uploaded) != bridgeHash(input.Uploaded) {
+				t.Fatal("media POST changed its uploaded payload or preceded the durable attempt")
+			}
+			if input.ClientID == clientID && (saved.Key != key || saved.Text != text || bridgeHash(saved.Media) != mediaHash || *saved.LastFailure != failure) {
+				t.Fatal("renewed-context retry changed the original media identity or prior failure evidence")
+			}
+			return
+		}
+		t.Fatal("media POST created an unjournalled identity")
+	}
+	if err := e.deliverWeixin(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.deliverWeixin(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	first = e.state.Outbound[0]
+	if len(w.mediaSends) != 2 || first.Status != "rejected" || first.Attempts != 2 || first.ContextToken != "renewed-context" ||
+		len(n.downloads) != 1 || w.slots != 1 || w.uploads != 1 {
+		t.Fatal("renewed context did not permit exactly one final-message retry, or repeated the media upload")
+	}
+	e.state = bridgeClone(t, e.state)
+	e.state.ContextToken, w.mediaSendErr = "next-context", nil
+	if err := e.deliverWeixin(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	// The first ACK releases the remaining images in the same native message.
+	for phase := 0; phase < 8; phase++ {
+		if e.mediaBusy == nil {
+			t.Fatal("remaining image did not start its next media phase")
+		}
+		bridgeFinishMedia(t, e)
+		if err := e.deliverWeixin(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(e.state.Outbound) != 3 || len(w.mediaSends) != 5 || len(n.downloads) != 3 || w.slots != 3 || w.uploads != 3 {
+		t.Fatal("multi-image recovery duplicated media uploads or dropped a later image")
+	}
+	for _, out := range e.state.Outbound {
+		if out.Status != "acknowledged" || out.WeixinID == "" || !out.Media.Cleaned {
+			t.Fatal("a retained image did not reach a reliable ACK and cleanup")
+		}
+	}
+	if e.state.Outbound[0].Attempts != 3 || e.state.Outbound[1].Attempts != 1 || e.state.Outbound[2].Attempts != 1 {
+		t.Fatal("final-message attempt counts lost the original rejection evidence")
+	}
+	m.Content.Text = "later edited caption"
+	if err := e.queueNative(m, true, bridgeNativeFingerprint(m)); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.deliverWeixin(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(e.state.Outbound) != 4 || len(w.mediaSends) != 5 || len(n.downloads) != 3 || w.slots != 3 || w.uploads != 3 {
+		t.Fatal("a caption edit resent acknowledged image originals")
+	}
+}
+
+func TestBridgeUploadedMediaRenewalRetainsUnknownAndInvalidRetries(t *testing.T) {
+	for _, test := range []string{"unknown-error", "mismatched-ack", "other-ret", "http-status", "errcode", "url-unknown", "cleaned", "wrong-kind", "invalid-uploaded"} {
+		t.Run(test, func(t *testing.T) {
+			e, n, w := bridgeTestMediaEngine(t)
+			n.downloadSize, n.downloadMIME = 32, "image/png"
+			m := bridgeNativeWithFile("image-original", "")
+			m.Content.Text = ""
+			if err := e.queueNative(m, false, bridgeNativeFingerprint(m)); err != nil {
+				t.Fatal(err)
+			}
+			for phase := 0; phase < 4; phase++ {
+				if err := e.deliverWeixin(context.Background()); err != nil {
+					t.Fatal(err)
+				}
+				bridgeFinishMedia(t, e)
+			}
+			out := e.state.Outbound[0]
+			if test == "unknown-error" || test == "mismatched-ack" {
+				if test == "unknown-error" {
+					w.mediaSendErr = weixin.ErrOutcomeUnknown
+				} else {
+					e.weixin = &bridgeDispatchMismatchedMediaACK{w}
+				}
+				if err := e.deliverWeixin(context.Background()); err != nil {
+					t.Fatal(err)
+				}
+				e.state = bridgeClone(t, e.state)
+				e.state.ContextToken, w.mediaSendErr = "renewed-context", nil
+				before := bridgeHash(e.state.Outbound[0])
+				for pass := 0; pass < 2; pass++ {
+					if err := e.deliverWeixin(context.Background()); err != nil {
+						t.Fatal(err)
+					}
+				}
+				if bridgeHash(e.state.Outbound[0]) != before || len(w.mediaSends) != 1 ||
+					w.slots != 1 || w.uploads != 1 || len(n.downloads) != 1 {
+					t.Fatal("fresh context replayed or changed an unknown media result")
+				}
+				return
+			}
+			out.Status, out.ContextToken, out.Attempts = "rejected", "old-context", 1
+			out.LastFailure = &bridgeSendFailure{Op: "sendmessage", Ret: -2}
+			switch test {
+			case "other-ret":
+				out.LastFailure.Ret = -3
+			case "http-status":
+				out.LastFailure.HTTPStatus = 413
+			case "errcode":
+				out.LastFailure.ErrCode = 4
+			case "url-unknown":
+				out.Media.Stage = "url_unknown"
+			case "cleaned":
+				out.Media.Cleaned = true
+			case "wrong-kind":
+				out.DeliveryKind = ""
+			case "invalid-uploaded":
+				out.Media.Uploaded.DownloadParam = ""
+			}
+			before := bridgeHash(out)
+			if bridgeResumeContextRejection(out, "renewed-context") || bridgeHash(out) != before {
+				t.Fatal("media renewal admitted another rejection or an invalid/unconfirmed original")
+			}
+		})
+	}
+}
+
 func TestBridgeShutdownRemovesUncommittedDownloadOrCipher(t *testing.T) {
 	for _, phase := range []string{"downloading", "preparing"} {
 		t.Run(phase, func(t *testing.T) {
@@ -622,6 +798,7 @@ func TestBridgeWeixinMediaUnknownAtEveryMutationDoesNotRepeat(t *testing.T) {
 			beforeSlots, beforeUploads, beforeSends := w.slots, w.uploads, len(w.mediaSends)
 			e.state = bridgeClone(t, e.state)
 			e.mediaBusy = nil
+			e.state.ContextToken = "renewed-context"
 			w.slotErr = nil
 			w.uploadErr = nil
 			w.mediaSendErr = nil

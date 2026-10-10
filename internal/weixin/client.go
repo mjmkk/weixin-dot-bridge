@@ -30,19 +30,60 @@ var (
 	ErrProtocol           = errors.New("unexpected Weixin API response")
 )
 
+const (
+	APIReasonRateLimited   = "rate_limited"
+	APIReasonPrepareFailed = "prepare_failed"
+	APIReasonEmpty         = "empty"
+	APIReasonOther         = "other"
+)
+
 // APIError deliberately excludes URLs, request bodies, credentials, and server
-// error text because any of those may echo secret values. Use errors.Is for Kind.
+// error text because any of those may echo secret values. Reason is only a fixed
+// diagnostic enum; it does not establish a quota or change retry behavior.
+// Use errors.Is for Kind.
 type APIError struct {
 	Op         string
 	Kind       error
 	HTTPStatus int
 	Ret        int
 	ErrCode    int
+	Reason     string
 	cause      error
 }
 
 func (e *APIError) Error() string {
+	if reason := safeAPIReason(e.Reason); reason != "" {
+		return fmt.Sprintf("Weixin %s: %s (http=%d ret=%d errcode=%d reason=%s)", e.Op, e.Kind, e.HTTPStatus, e.Ret, e.ErrCode, reason)
+	}
 	return fmt.Sprintf("Weixin %s: %s (http=%d ret=%d errcode=%d)", e.Op, e.Kind, e.HTTPStatus, e.Ret, e.ErrCode)
+}
+
+func safeAPIReason(reason string) string {
+	switch reason {
+	case "", APIReasonRateLimited, APIReasonPrepareFailed, APIReasonEmpty, APIReasonOther:
+		return reason
+	default:
+		return APIReasonOther
+	}
+}
+
+func rejectionReason(raw json.RawMessage) string {
+	var message string
+	if len(raw) != 0 && json.Unmarshal(raw, &message) != nil {
+		return APIReasonOther
+	}
+	// Match the complete decoded value. Do not trim, search, retain, or echo any
+	// other server error text, which may contain user content or credentials.
+	switch message {
+	case "rate limited":
+		return APIReasonRateLimited
+	case "prepare failed":
+		return APIReasonPrepareFailed
+	case "":
+		return APIReasonEmpty
+	default:
+		return APIReasonOther
+	}
 }
 
 func (e *APIError) Is(target error) bool { return target == e.Kind }
@@ -229,6 +270,23 @@ func (c *Client) do(ctx context.Context, base *url.URL, method, endpoint string,
 			kind = ErrOutcomeUnknown
 		}
 		return &APIError{Op: op, Kind: kind, HTTPStatus: response.StatusCode}
+	}
+	// Text and media callers use separate response structs. Classify only their
+	// existing sendmessage business rejection here, after the original typed and
+	// complete-JSON checks, preserving its operation, kind, and numeric facts.
+	if op == "ilink/bot/sendmessage" {
+		var failure struct {
+			Ret     int             `json:"ret"`
+			ErrCode int             `json:"errcode"`
+			ErrMsg  json.RawMessage `json:"errmsg"`
+		}
+		if json.Unmarshal(raw, &failure) == nil {
+			if err := businessError("sendmessage", failure.Ret, failure.ErrCode); err != nil {
+				api := err.(*APIError)
+				api.Reason = rejectionReason(failure.ErrMsg)
+				return api
+			}
+		}
 	}
 	return nil
 }

@@ -72,13 +72,15 @@ type bridgeOutbound struct {
 	MetadataSupersession *bridgeMetadataSupersession `json:"metadata_supersession,omitempty"`
 }
 
-// Only numeric protocol facts and a fixed local operation name are retained.
+// Only numeric protocol facts, a fixed local operation name, and a fixed reason
+// enum are retained.
 // Raw errors can include secrets and must never be written to the journal.
 type bridgeSendFailure struct {
 	Op         string `json:"op"`
 	HTTPStatus int    `json:"http_status,omitempty"`
 	Ret        int    `json:"ret,omitempty"`
 	ErrCode    int    `json:"errcode,omitempty"`
+	Reason     string `json:"reason,omitempty"`
 }
 
 type bridgeMetadataSupersession struct {
@@ -177,6 +179,12 @@ func bridgeSendFailureRecord(err error, op string) *bridgeSendFailure {
 	var wx *weixin.APIError
 	if op == "sendmessage" && errors.As(err, &wx) {
 		record.HTTPStatus, record.Ret, record.ErrCode = wx.HTTPStatus, wx.Ret, wx.ErrCode
+		switch wx.Reason {
+		case "", weixin.APIReasonRateLimited, weixin.APIReasonPrepareFailed, weixin.APIReasonEmpty, weixin.APIReasonOther:
+			record.Reason = wx.Reason
+		default:
+			record.Reason = weixin.APIReasonOther
+		}
 	}
 	var native *chatgpt.HTTPError
 	if op == "native_sendmessage" && errors.As(err, &native) {
@@ -186,7 +194,15 @@ func bridgeSendFailureRecord(err error, op string) *bridgeSendFailure {
 }
 
 func bridgeSendFailureValid(record *bridgeSendFailure, op string) bool {
-	return record == nil || (record.Op == op && (record.HTTPStatus == 0 || (record.HTTPStatus >= 100 && record.HTTPStatus <= 599)))
+	if record == nil {
+		return true
+	}
+	switch record.Reason {
+	case "", weixin.APIReasonRateLimited, weixin.APIReasonPrepareFailed, weixin.APIReasonEmpty, weixin.APIReasonOther:
+		return record.Op == op && (record.HTTPStatus == 0 || (record.HTTPStatus >= 100 && record.HTTPStatus <= 599))
+	default:
+		return false
+	}
 }
 
 func bridgeRefreshedNativeCapability(before, after chatgpt.Message) bool {

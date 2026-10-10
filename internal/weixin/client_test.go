@@ -140,6 +140,85 @@ func TestExpiredAndUnknownOutcomesRemainDistinct(t *testing.T) {
 	}
 }
 
+func TestSendBusinessReasonIsExactSafeEnumForTextAndMedia(t *testing.T) {
+	for _, sendKind := range []string{"text", "media"} {
+		for _, tc := range []struct {
+			name, body, reason string
+			want               error
+		}{
+			{"rate", `{"ret":-2,"errmsg":"rate limited"}`, APIReasonRateLimited, ErrAPI},
+			{"prepare", `{"ret":-2,"errmsg":"prepare failed"}`, APIReasonPrepareFailed, ErrAPI},
+			{"empty", `{"ret":-2,"errmsg":""}`, APIReasonEmpty, ErrAPI},
+			{"missing", `{"ret":-2}`, APIReasonEmpty, ErrAPI},
+			{"null", `{"ret":-2,"errmsg":null}`, APIReasonEmpty, ErrAPI},
+			{"opaque", `{"ret":-2,"errmsg":"private-error-marker"}`, APIReasonOther, ErrAPI},
+			{"prefix", `{"ret":-2,"errmsg":"rate limited private-error-marker"}`, APIReasonOther, ErrAPI},
+			{"whitespace", `{"ret":-2,"errmsg":" rate limited "}`, APIReasonOther, ErrAPI},
+			{"case", `{"ret":-2,"errmsg":"RATE LIMITED"}`, APIReasonOther, ErrAPI},
+			{"object", `{"ret":-2,"errmsg":{"secret":"private-error-marker"}}`, APIReasonOther, ErrAPI},
+			{"expired", `{"ret":0,"errcode":-14,"errmsg":"private-error-marker"}`, APIReasonOther, ErrSessionExpired},
+		} {
+			t.Run(sendKind+"/"+tc.name, func(t *testing.T) {
+				requests := 0
+				c := testClient(t, func(r *http.Request) (*http.Response, error) {
+					requests++
+					return reply(r, 200, tc.body), nil
+				})
+				var err error
+				if sendKind == "text" {
+					_, err = c.SendText(context.Background(), SendTextRequest{ToUserID: "owner", ClientID: "id", ContextToken: "context", Text: "hello"})
+				} else {
+					_, err = c.SendMedia(context.Background(), SendMediaRequest{ToUserID: "owner", ClientID: "id", ContextToken: "context", Uploaded: UploadedMedia{
+						Type: ImageItemType, ToUserID: "owner", RawSize: 1, CipherSize: 16,
+						AESKeyHex: strings.Repeat("00", 16), DownloadParam: "fixture-download-reference",
+					}})
+				}
+				var api *APIError
+				if !errors.Is(err, tc.want) || !errors.As(err, &api) || api.Op != "sendmessage" || api.Reason != tc.reason || api.HTTPStatus != 0 || requests != 1 {
+					t.Fatal("reason diagnostic changed the business rejection or repeated the send")
+				}
+				encoded, marshalErr := json.Marshal(api)
+				if marshalErr != nil || strings.Contains(string(encoded), "private-error-marker") || strings.Contains(api.Error(), "private-error-marker") || !strings.Contains(api.Error(), "reason="+tc.reason) {
+					t.Fatal("server error text escaped the reason whitelist")
+				}
+			})
+		}
+	}
+}
+
+func TestReasonDiagnosticDoesNotChangeHTTPOrUnconfirmedResponse(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		status int
+		body   string
+		want   error
+	}{
+		{"missing-ack", 200, `{"ret":0,"errmsg":"rate limited"}`, ErrOutcomeUnknown},
+		{"trailing-json", 200, `{"ret":-2,"errmsg":"rate limited"}{}`, ErrOutcomeUnknown},
+		{"invalid-ret", 200, `{"ret":"-2","errmsg":"rate limited"}`, ErrOutcomeUnknown},
+		{"invalid-id", 200, `{"ret":-2,"message_id":{},"errmsg":"rate limited"}`, ErrOutcomeUnknown},
+		{"http-server", 503, `{"ret":-2,"errmsg":"rate limited"}`, ErrOutcomeUnknown},
+		{"http-reject", 403, `{"ret":-2,"errmsg":"rate limited"}`, ErrAPI},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			requests := 0
+			c := testClient(t, func(r *http.Request) (*http.Response, error) {
+				requests++
+				return reply(r, tc.status, tc.body), nil
+			})
+			_, err := c.SendText(context.Background(), SendTextRequest{ToUserID: "owner", ClientID: "id", ContextToken: "context", Text: "hello"})
+			var api *APIError
+			if !errors.Is(err, tc.want) || !errors.As(err, &api) || api.Reason != "" || requests != 1 {
+				t.Fatal("reason diagnostic reclassified an HTTP or unknown send result")
+			}
+		})
+	}
+	api := &APIError{Op: "sendmessage", Kind: ErrAPI, Reason: "private-error-marker"}
+	if strings.Contains(api.Error(), "private-error-marker") || !strings.Contains(api.Error(), "reason=other") {
+		t.Fatal("untrusted reason was printed verbatim")
+	}
+}
+
 func TestSendNetworkFailureIsUnknownAndDoesNotExposeURL(t *testing.T) {
 	requests := 0
 	c := testClient(t, func(r *http.Request) (*http.Response, error) {

@@ -1,0 +1,18 @@
+[Unit]
+Description=Personal Weixin to existing dot message bridge
+
+[Service]
+Type=simple
+EnvironmentFile=-%h/.config/weixin-dot/network.env
+ExecStart=%h/.local/bin/weixin-dot bridge --room __VERIFIED_ROOM__ --dot __VERIFIED_DOT__
+UMask=0077
+NoNewPrivileges=true
+# Intentional authentication/identity failures stop for reconciliation.
+# Network read failures are handled by the same process and durable journal.
+Restart=on-abnormal
+RestartSec=5s
+KillSignal=SIGTERM
+TimeoutStopSec=45s
+
+[Install]
+WantedBy=default.target

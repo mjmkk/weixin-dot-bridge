@@ -2,6 +2,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
@@ -134,10 +135,9 @@ func bridgeHash(v any) string {
 	return hex.EncodeToString(h[:])
 }
 
-// Native file download capabilities refresh without changing the message.
-// Ignore only the observed volatile field, retaining all attachment identities,
-// permissions, statuses and other payload fields for edit detection.
-func bridgeNativeFingerprint(m chatgpt.Message) string {
+// Retain the previous fingerprint for exact saved-revision migration. It must
+// not match an arbitrary older revision and thereby hide a real text revert.
+func bridgeLegacyNativeFingerprint(m chatgpt.Message) string {
 	if len(m.Content.Attachments) == 0 {
 		return bridgeHash(m)
 	}
@@ -161,13 +161,48 @@ func bridgeNativeFingerprint(m chatgpt.Message) string {
 	return bridgeHash(m)
 }
 
+// File download capabilities and link thumbnails refresh without changing a
+// message. Ignore only those observed volatile fields. Canonical JSON removes
+// object key-order differences without losing integer precision or changing
+// the saved original attachment, identities, permissions or status fields.
+func bridgeNativeFingerprint(m chatgpt.Message) string {
+	attachments := make([]json.RawMessage, len(m.Content.Attachments))
+	copy(attachments, m.Content.Attachments)
+	for i, raw := range attachments {
+		decoder := json.NewDecoder(bytes.NewReader(raw))
+		decoder.UseNumber()
+		var value any
+		if decoder.Decode(&value) != nil {
+			continue
+		}
+		if attachment, ok := value.(map[string]any); ok {
+			switch attachment["type"] {
+			case "file":
+				if file, ok := attachment["file"].(map[string]any); ok {
+					delete(file, "download_url")
+				}
+			case "link":
+				delete(attachment, "thumbnail_url")
+			}
+		}
+		if normalized, err := json.Marshal(value); err == nil {
+			attachments[i] = normalized
+		}
+	}
+	// Preserve nil versus empty attachments as before.
+	if m.Content.Attachments != nil {
+		m.Content.Attachments = attachments
+	}
+	return bridgeHash(m)
+}
+
 // Older journals stored the raw message fingerprint. Upgrade a known revision
 // using its matching saved snapshot, rather than treating normalization as an
 // edit or matching an arbitrary historical revision that could hide a revert.
 func (e *bridgeEngine) priorNativeFingerprint(id, prior string) string {
 	for i := len(e.state.Outbound) - 1; i >= 0; i-- {
 		native := e.state.Outbound[i].Native
-		if native != nil && native.ID == id && bridgeHash(*native) == prior {
+		if native != nil && native.ID == id && (bridgeHash(*native) == prior || bridgeLegacyNativeFingerprint(*native) == prior) {
 			return bridgeNativeFingerprint(*native)
 		}
 	}
@@ -211,15 +246,23 @@ func bridgeRefreshedNativeCapability(before, after chatgpt.Message) bool {
 	}
 	capability := func(raw json.RawMessage) string {
 		var ref struct {
-			Type string `json:"type"`
-			File struct {
+			Type      string `json:"type"`
+			Thumbnail string `json:"thumbnail_url"`
+			File      struct {
 				URL string `json:"download_url"`
 			} `json:"file"`
 		}
-		if json.Unmarshal(raw, &ref) != nil || ref.Type != "file" {
+		if json.Unmarshal(raw, &ref) != nil {
 			return ""
 		}
-		return ref.File.URL
+		switch ref.Type {
+		case "file":
+			return ref.File.URL
+		case "link":
+			return ref.Thumbnail
+		default:
+			return ""
+		}
 	}
 	for i, raw := range before.Content.Attachments {
 		previous, current := capability(raw), capability(after.Content.Attachments[i])
@@ -233,12 +276,48 @@ func bridgeRefreshedNativeCapability(before, after chatgpt.Message) bool {
 func bridgeMetadataOnlyUpdate(out, acknowledged *bridgeOutbound, s *bridgeState) bool {
 	if out == nil || acknowledged == nil || out.Media != nil || out.Native == nil || acknowledged.Native == nil ||
 		acknowledged.Status != "acknowledged" || acknowledged.ContextToken == "" || acknowledged.WeixinID == "" ||
-		out.Native.ID != acknowledged.Native.ID || out.Native.Sender != s.DotSender || acknowledged.Native.Sender != s.DotSender ||
-		out.Native.Content.Text == "" || out.Text != "dot 更新：\n"+out.Native.Content.Text ||
-		(out.Key != "native:"+out.Native.ID+":"+bridgeHash(*out.Native) && out.Key != "native:"+out.Native.ID+":"+bridgeNativeFingerprint(*out.Native)) {
+		out.Native.ID != acknowledged.Native.ID || out.Native.Sender != acknowledged.Native.Sender || out.Native.Deleted != nil ||
+		(out.Native.Sender != s.DotSender && !bridgeHumanNative(*out.Native, s)) ||
+		(out.Key != "native:"+out.Native.ID+":"+bridgeHash(*out.Native) &&
+			out.Key != "native:"+out.Native.ID+":"+bridgeLegacyNativeFingerprint(*out.Native) &&
+			out.Key != "native:"+out.Native.ID+":"+bridgeNativeFingerprint(*out.Native)) {
 		return false
 	}
-	return bridgeRefreshedNativeCapability(*acknowledged.Native, *out.Native) && bridgeNativeFingerprint(*out.Native) == bridgeNativeFingerprint(*acknowledged.Native)
+	if bridgeHumanNative(*out.Native, s) {
+		body := acknowledged.Text
+		matched := false
+		for _, edited := range []bool{false, true} {
+			header := bridgeHumanNativeText(*acknowledged.Native, "", edited)
+			if strings.HasPrefix(body, header) {
+				body, matched = strings.TrimPrefix(body, header), true
+				break
+			}
+		}
+		if !matched || out.Text != bridgeHumanNativeText(*out.Native, body, true) {
+			return false
+		}
+	} else if out.Native.Content.Text == "" || out.Text != "dot 更新：\n"+out.Native.Content.Text {
+		return false
+	}
+	fingerprint := bridgeNativeFingerprint(*out.Native)
+	if !bridgeRefreshedNativeCapability(*acknowledged.Native, *out.Native) || fingerprint != bridgeNativeFingerprint(*acknowledged.Native) {
+		return false
+	}
+	// An A -> B -> A edit is still a real revision. A receipt for the older A
+	// cannot retire it across any intervening different native snapshot.
+	found := false
+	for _, prior := range s.Outbound {
+		if prior.Key == out.Key {
+			return found
+		}
+		if prior.Key == acknowledged.Key {
+			found = true
+		}
+		if found && prior.Native != nil && prior.Native.ID == out.Native.ID && bridgeNativeFingerprint(*prior.Native) != fingerprint {
+			return false
+		}
+	}
+	return false
 }
 
 func bridgeMetadataSupersessionValid(out *bridgeOutbound, s *bridgeState) bool {

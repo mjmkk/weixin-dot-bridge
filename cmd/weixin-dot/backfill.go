@@ -452,12 +452,19 @@ func backfillEnqueue(s *bridgeState, source *backfillSource, room, dot, peer str
 func bridgeIsHistory(out *bridgeOutbound) bool { return out != nil && out.DeliveryKind == "history" }
 
 // A renewed inbound context permits one new attempt after this exact known
-// rejection for text, including normal native replies and local notices. It does not
-// establish what ret=-2 means or a server quota/TTL.
+// rejection for text or an already uploaded native attachment. It does not
+// establish what ret=-2 means or a server quota/TTL. The caller validates the
+// journal's native identity and bound peer before considering this transition.
 // The engine journals the new token and attempting state before the POST, so
 // another rejection freezes this entry until the context changes again.
 func bridgeResumeContextRejection(out *bridgeOutbound, currentContext string) bool {
 	eligible := out != nil && out.Media == nil
+	if out != nil && out.Media != nil {
+		media := out.Media
+		eligible = out.Native != nil && out.Native.ID != "" && out.DeliveryKind == "media" &&
+			media.Stage == "uploaded" && !media.Cleaned && media.Uploaded != nil && media.Uploaded.ToUserID != "" &&
+			bridgeOutgoingRecordValid(media, media.Uploaded.ToUserID)
+	}
 	if !eligible || out.Status != "rejected" || out.LastFailure == nil ||
 		out.LastFailure.Op != "sendmessage" || out.LastFailure.Ret != -2 ||
 		out.LastFailure.HTTPStatus != 0 || out.LastFailure.ErrCode != 0 ||

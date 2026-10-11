@@ -15,6 +15,43 @@ import (
 	"github.com/mjmkk/weixin-dot-bridge/internal/weixin"
 )
 
+func TestBridgeSendFailureReasonWhitelistAndLegacyCompatibility(t *testing.T) {
+	for _, reason := range []string{"", weixin.APIReasonRateLimited, weixin.APIReasonPrepareFailed, weixin.APIReasonEmpty, weixin.APIReasonOther, "private-error-marker"} {
+		record := bridgeSendFailureRecord(&weixin.APIError{Op: "private-operation-marker", Kind: weixin.ErrAPI, Ret: -2, Reason: reason}, "sendmessage")
+		want := reason
+		if reason == "private-error-marker" {
+			want = weixin.APIReasonOther
+		}
+		if record.Reason != want || record.Op != "sendmessage" || record.Ret != -2 || !bridgeSendFailureValid(record, "sendmessage") {
+			t.Fatal("safe reason or numeric protocol facts were lost")
+		}
+		encoded, err := json.Marshal(record)
+		if err != nil || strings.Contains(string(encoded), "private-error-marker") || strings.Contains(string(encoded), "private-operation-marker") {
+			t.Fatal("untrusted error data entered the failure journal")
+		}
+		var restored bridgeSendFailure
+		if json.Unmarshal(encoded, &restored) != nil || restored != *record || !bridgeSendFailureValid(&restored, "sendmessage") {
+			t.Fatal("reason failure record did not survive journal serialization")
+		}
+		out := &bridgeOutbound{Status: "rejected", ContextToken: "old-context", LastFailure: &restored}
+		if !bridgeResumeContextRejection(out, "new-context") || out.Status != "ready" {
+			t.Fatal("diagnostic reason changed the existing known-rejection renewal rule")
+		}
+		out.Status = "rejected"
+		if bridgeResumeContextRejection(out, "old-context") {
+			t.Fatal("diagnostic reason enabled a same-context retry")
+		}
+	}
+	var legacy bridgeSendFailure
+	if json.Unmarshal([]byte(`{"op":"sendmessage","ret":-2}`), &legacy) != nil || legacy.Reason != "" || !bridgeSendFailureValid(&legacy, "sendmessage") {
+		t.Fatal("legacy failure records without a reason were rejected")
+	}
+	legacy.Reason = "private-error-marker"
+	if bridgeSendFailureValid(&legacy, "sendmessage") {
+		t.Fatal("journal accepted a non-enum reason")
+	}
+}
+
 type bridgeNativeFake struct {
 	pages      []*chatgpt.Page
 	reads      []string
